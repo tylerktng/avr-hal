@@ -43,3 +43,7 @@ pub use trinket_pro::*;
 mod trinket;
 #[cfg(feature = "trinket")]
 pub use trinket::*;
+#[cfg(feature = "quadremote")]
+mod quadremote;
+#[cfg(feature = "quadremote")]
+pub use quadremote::*;
