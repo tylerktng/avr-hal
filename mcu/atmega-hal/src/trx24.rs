@@ -1,6 +1,6 @@
 // 2.4 GHz Trasmitter
 
-use crate::pac::trx24 as rf24;
+use crate::pac::{TRX24, trx24 as rf24};
 use crate::pac::pwrctrl as pc;
 // pub struct IEEEMacAddress {
 // 	reg0: IEEE_ADDR_0,
@@ -16,6 +16,67 @@ use crate::pac::pwrctrl as pc;
 // impl IEEEMacAddress {
 
 // }
+
+pub enum RfChannel {
+	Mhz2405 = 11,
+	Mhz2410 = 12,
+	Mhz2415 = 13,
+	Mhz2420 = 14,
+	Mhz2425 = 15,
+	Mhz2430 = 16,
+	Mhz2435 = 17,
+	Mhz2440 = 18,
+	Mhz2445 = 19,
+	Mhz2450 = 20,
+	Mhz2455 = 21,
+	Mhz2460 = 22,
+	Mhz2465 = 23,
+	Mhz2470 = 24,
+	Mhz2475 = 25,
+	Mhz2480 = 26,
+}
+
+impl Default for RfChannel {
+	fn default() -> Self {
+		Self::Mhz2405
+	}
+}
+
+pub struct RfBuf {
+	buf: [u8; 256],
+	r_idx: usize,
+	w_idx: usize,
+}
+
+impl RfBuf {
+	pub fn new() -> Self {
+		let buf: [u8; 256] = [0; 256];
+		Self {
+			buf,
+			r_idx: 0,
+			w_idx: 0,
+		}
+	}
+
+	pub fn read(&mut self) -> &[u8] {
+		let len = self.buf[self.r_idx];
+		let idx = self.r_idx;
+		self.r_idx = (self.r_idx + 128) % 256;
+		if len > 0 {
+			&self.buf[idx..idx + 128]
+		} else {
+			&[]
+		}
+	}
+
+	pub fn write(&mut self, data: &[u8]) {
+		let len = data[0] as usize;
+		self.buf[self.w_idx] = len as u8;
+		for i in 1..len+1 {
+			self.buf[self.w_idx + i] = data[i];
+		}
+	}
+}
 
 pub struct AesModule {
 	aes_ctrl: rf24::AES_CTRL,
@@ -111,9 +172,9 @@ impl AesModule {
 // 1. To listen for signals, use `rx_on()`.
 pub struct Trx24 {
 	/// Peripheral 
-	peripheral: crate::pac::TRX24,
+	p: crate::pac::TRX24,
 	/// TRX Power management reg
-	trx_pr: *mut pc::TRXPR::u8,
+	trx_pr: pc::TRXPR,
 
 	//Mac address regs	
 	// mac: MacAddress,
@@ -145,51 +206,49 @@ pub struct Trx24 {
 impl Trx24 {
 	/// Initializes the Trx24 module.
 	/// 
-	pub fn new(peripheral: TRX24, trx_pr: *mut pc::TRXPR::u8) -> Self {
+	pub fn new(peripheral: TRX24, trx_pr: pc::TRXPR) -> Self {
 		//TODO
-		let trx_pr = 
 		let new = Self {
-			peripheral:
+			p: peripheral,
 			trx_pr,
-
 		};
-		new.rfBegin();
-
+		new.rfBegin(RfChannel::default());
 		new
 	}
 
 	// Convenience method for configuring the tranceiver. Ported from radio.cpp
 	// Original by Jim Lindblom, Sparkfun Electronics (License: Beerware)
-	fn rfBegin(&self, rf_channel: u8) {
-		
+	fn rfBegin(&self, rf_channel: RfChannel) {
 		self.trx_pr.write(|w| unsafe {w.trxrst().set_bit()}); //reset
-		self.irq_mask.write(|w| unsafe {w.bits(0)}); //clear interrupts
-		self.trx_state.write(|w| unsafe {w.trx_cmd().cmd_trx_off()}); //turn off
+		self.p.irq_mask.write(|w| unsafe {w.bits(0)}); //clear interrupts
+		self.p.trx_state.write(|w| unsafe {w.trx_cmd().cmd_trx_off()}); //turn off
 		// arduino_hal::delay_ms(1); //wait for transmission to finish
 		//Enable auto crc calculations
-		self.trx_ctrl.write(|w| unsafe {w.tx_auto_crc_on().set_bit()});
+		self.p.trx_ctrl_1.write(|w| unsafe {w.tx_auto_crc_on().set_bit()});
 		//Enable interrupts
-		self.irq_mask.write(|w| unsafe {
+		self.p.irq_mask.write(|w| unsafe {
 			w.rx_start_en().set_bit()
 			 .rx_end_en().set_bit()
 			 .tx_end_en().set_bit()
 		});
 		//Configure channel (See datasheet: 9.12.12)
-		if rf_channel < 11 {
-			self.phy_cc_cca.write(|w| unsafe {w.channel().bits(11)});
-		} else if rf_channel > 26 {
-			self.phy_cc_cca.write(|w| unsafe {w.channel().bits(26)});
+		let channel = rf_channel as u8;
+		if channel < 11 {
+			self.p.phy_cc_cca.write(|w| unsafe {w.channel().bits(11)});
+		} else if channel > 26 {
+			self.p.phy_cc_cca.write(|w| unsafe {w.channel().bits(26)});
 		} else {
-			self.phy_cc_cca.write(|w| unsafe {w.channel().bits(rf_channel)});
+			self.p.phy_cc_cca.write(|w| unsafe {w.channel().bits(channel)});
 		}
 		//Default state is RX_ON to listen for incoming messages.
-		self.trx_state.write(|w| unsafe {w.trx_cmd().cmd_rx_on()});
+		self.p.trx_state.write(|w| unsafe {w.trx_cmd().cmd_rx_on()});
+		unsafe {RFBUFFER = Some(RfBuf::new());}
 	}
 
 	/// Puts the tranceiver into the state TRX_OFF from SLEEP. If the state is
 	/// not in SLEEP, this function returns false.
 	pub fn rfWake(&self, force: bool) -> bool {
-		if self.trx_status.read().is_sleep() {
+		if self.p.trx_status.read().trx_status().is_sleep() {
 			self.trx_pr.write(|w| unsafe {w.slptr().clear_bit()});
 			true
 		} else {
@@ -201,9 +260,9 @@ impl Trx24 {
 	/// true, forcibly turns off the tranceiver off before setting the state.
 	/// Otherwise, sets the state to off after the tranceiver is no longer busy
 	/// before putting the tranceiver to SLEEP.
-	pub fn rfSleep(force: bool) {
+	pub fn rfSleep(&self, force: bool) {
 		if !force {
-			let status = trx_status.read();
+			let status = self.p.trx_status.read().trx_status();
 			// Busy wait for the status. Perhaps we can use interrupts here
 			// instead?
 			while status.is_busy_rx() || 
@@ -211,22 +270,22 @@ impl Trx24 {
 			      status.is_busy_rx_aack() ||
 			      status.is_busy_tx_aret() ||
 			      status.is_state_transition_in_progress() {}
-			self.trx_state.write(|w| unsafe {w.trx_cmd().cmd_trx_off()});
+			self.p.trx_state.write(|w| unsafe {w.trx_cmd().cmd_trx_off()});
 		} else {
-			self.trx_state.write(|w| unsafe {w.trx_cmd().cmd_force_trx_off()});
+			self.p.trx_state.write(|w| unsafe {w.trx_cmd().cmd_force_trx_off()});
 		}
-		while status.is_state_transition_in_progress() {}
+		while self.p.trx_status.read().trx_status().is_state_transition_in_progress() {}
 		self.trx_pr.write(|w| unsafe {w.slptr().set_bit()});
 	}
 
 	// Write up to 128 bits of data to the frame buffer.
 	pub fn rfWrite(&self, data: &[u8], len: u8) {
-		self.trx_state.write(|w| unsafe {w.trx_cmd().cmd_pll_on()});
+		self.p.trx_state.write(|w| unsafe {w.trx_cmd().cmd_pll_on()});
 		//Spin until PLL is locked
-		while self.trx_status.read().trx_status().is_pll_on() {} 
+		while self.p.trx_status.read().trx_status().is_pll_on() {} 
 		//Frame buffer address
 		unsafe {
-			let fb_ptr = self.trx_fb_st.as_ptr();
+			let fb_ptr = self.p.trxfbst.as_ptr();
 			*fb_ptr = len + 2;
 			for i in 0..len {
 				*(fb_ptr.add((i + 1) as usize)) = data[i as usize];
@@ -234,31 +293,45 @@ impl Trx24 {
 		}
 	}
 
-	pub fn rfAvailable(&self) -> bool {
-
+	/// Returns the number of bytes stored in the RF buffer.
+	pub fn rfAvailable(&self) -> usize {
+		0
 	}
 
-	pub fn rfRead(&self, ) {
+	pub fn rfRead(&self) {
 
 	}
 }
-// Registers for callbacks. Initialize when the TRX Peripheral is initialized.
-static mut RECSTR: Option<rf24::PHY_RSSI> = None;
-static mut FRAMEBUF: Option<rf24::TRXFBST> = None;
 
-/// When receiver is done, call this interrupt
+// Registers for callbacks. Initialize when the TRX Peripheral is initialized.
+// static mut PHYRSSI: Option<rf24::PHY_RSSI> = None;
+// static mut FRAMEBUF: Option<rf24::TRXFBST> = None;
+static mut RFBUFFER: Option<RfBuf> = None;
+
+
+/// When receiver is done, call this interrupt 
 #[avr_device::interrupt(atmega128rfa1)]
 fn TRX24_RX_END() {
-	let rec = unsafe { RECSTR.read().is_crc_valid()};
-	if rec {
-		unsafe {
+		let validrx = unsafe {(*TRX24::ptr()).phy_rssi.read().rx_crc_valid().is_crc_valid()};
+		if validrx {
 			//length is contained in the first byte of the frame buffer.
-			let fb_ptr = 
-
+			let ptr = unsafe {(*TRX24::ptr()).trxfbst.as_ptr()};
+			let mut temp: [u8; 128] = [0; 128];
+			//copy over 
+			temp[0] = unsafe {*ptr};
 			//copy over to the main mem buffer
+			for i in 1..128 {
+				temp[i] = unsafe{*ptr.add(i)};
+			}
+			unsafe {
+				if RFBUFFER.is_some() {
+					RFBUFFER.as_mut().map(|buf| buf.write(&temp[0..128]));
+				}
+			}
+			
+
 
 		}
-	}
 }
 
 
